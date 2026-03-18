@@ -4,35 +4,35 @@ import asyncio
 import numpy as np
 import pandas as pd
 import gspread
+import pytz
+from datetime import datetime
 from fastapi import FastAPI
 from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
 
-# 1. Load environment variables from .env (for Codespaces/Local)
+# 1. Load environment variables
 load_dotenv()
 
 app = FastAPI()
 
 # --- Configuration ---
-# Get the path from .env; default to 'creds.json' if not set
 CREDS_PATH = os.getenv("GOOGLE_JSON", "creds.json") 
 SHEET_NAME = "Robot_Maintenance"
 THRESHOLD_POSE_DRIFT = 0.05
-UPDATE_INTERVAL = 10  # Seconds (Safe for Google API rate limits)
+UPDATE_INTERVAL = 15  # Increased slightly to avoid Google API rate limits
+BKK_TZ = pytz.timezone('Asia/Bangkok')
 
 # Global state
 telemetry_active = False
 history = []
 
 def get_gspread_client():
-    """Connects to Google Sheets using the filepath provided in .env"""
     if not os.path.exists(CREDS_PATH):
         print(f"CRITICAL: Credentials file NOT FOUND at: {CREDS_PATH}")
         return None
     
     try:
         SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        # Use the path from your .env to load the file
         CREDS = ServiceAccountCredentials.from_json_keyfile_name(CREDS_PATH, SCOPE)
         return gspread.authorize(CREDS)
     except Exception as e:
@@ -55,13 +55,17 @@ def calculate_robot_metrics(history):
     return {'Health': int(health), 'Status': status}
 
 def get_robot_reading(step, mode):
-    timestamp = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    # LOCALIZED TIME: Get current time in Bangkok
+    now_bkk = datetime.now(BKK_TZ)
+    timestamp = now_bkk.strftime('%Y-%m-%d %H:%M:%S')
+    
     if mode == 'NORMAL':
         current, drift = np.random.normal(10, 0.4), np.random.normal(0.01, 0.001)
     elif mode == 'FAILING':
         current, drift = np.random.normal(12, 0.7) + (step * 0.35), np.random.normal(0.02, 0.004) + (step * 0.0025)
     else: # COOLING
         current, drift = max(8, 14 - (step * 1.5)), max(0.008, 0.045 - (step * 0.008))
+    
     return {'timestamp': timestamp, 'motor_current': current, 'pose_drift': drift, 'mode': mode}
 
 # --- Background Process ---
@@ -72,9 +76,10 @@ async def telemetry_loop():
         return
 
     try:
+        # Open sheet once to keep connection alive
         sheet = client.open(SHEET_NAME).sheet1
         step, mode = 0, 'NORMAL'
-        print(f"Connected to {SHEET_NAME}. Loop starting...")
+        print(f"Connected to {SHEET_NAME}. BKK Telemetry starting...")
 
         while telemetry_active:
             reading = get_robot_reading(step, mode)
@@ -83,7 +88,6 @@ async def telemetry_loop():
 
             metrics = calculate_robot_metrics(history)
             
-            # Prepare row: Timestamp, Current, Drift, Health, Status, Mode
             row = [
                 reading['timestamp'], 
                 round(reading['motor_current'], 2), 
@@ -93,8 +97,13 @@ async def telemetry_loop():
                 mode
             ]
             
-            sheet.append_row(row)
-            print(f"Synced Health: {metrics['Health']}% | Status: {metrics['Status']}")
+            # SAFE SYNC: Catching API errors specifically
+            try:
+                sheet.append_row(row, value_input_option='USER_ENTERED')
+                print(f"✅ Synced BKK Time: {reading['timestamp']} | Health: {metrics['Health']}%")
+            except Exception as sync_err:
+                print(f"⚠️ Sync skipped (likely API Quota): {sync_err}")
+                await asyncio.sleep(20) # Wait longer if Google is busy
 
             # State Transitions
             if mode == 'COOLING':
@@ -111,12 +120,16 @@ async def telemetry_loop():
             await asyncio.sleep(UPDATE_INTERVAL)
 
     except Exception as e:
-        print(f"Main Loop Error: {e}")
+        print(f"❌ Connection Fatal Error: {e}")
 
 # --- API Endpoints ---
 @app.get("/")
 def health_check():
-    return {"status": "Online", "creds_file_exists": os.path.exists(CREDS_PATH)}
+    return {
+        "status": "Online", 
+        "timezone": "Asia/Bangkok",
+        "creds_file_exists": os.path.exists(CREDS_PATH)
+    }
 
 @app.on_event("startup")
 async def startup_event():

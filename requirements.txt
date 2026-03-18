@@ -1,8 +1,9 @@
+pytz
 fastapi
 uvicorn
+python-dotenv
 gspread
 oauth2client
 pandas
 numpy
 scikit-learn
-python-dotenv
